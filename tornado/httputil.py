@@ -35,7 +35,7 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 from tornado.escape import native_str, parse_qs_bytes, utf8
 from tornado.log import gen_log
-from tornado.util import ObjectDict, unicode_type
+from tornado.util import ObjectDict, unicode_type, _StreamBuffer
 
 
 # responses is unused in this file, but we re-export it to other files.
@@ -928,7 +928,7 @@ class StreamingMultipartFormDataParser(object):
 
         # Variables to store the current state of the parser.
         self._state = ParserState.PARSE_BOUNDARY_LINE
-        self._buffer = bytearray()
+        self._buffer = _StreamBuffer()
 
         # Variables to hold the boundary matches.
         self._boundary_next = "--{}\r\n".format(self._boundary).encode()
@@ -936,8 +936,8 @@ class StreamingMultipartFormDataParser(object):
         self._boundary_base = self._boundary_next[:-2]
 
         # Variables for caching boundary matching.
-        self._last_idx = 0
-        self._boundary_idx = 0
+        self._search_field = b""
+        self._is_partial_match = False
 
     @property
     def boundary(self) -> str:
@@ -968,7 +968,7 @@ class StreamingMultipartFormDataParser(object):
             )
         # Ignore incrementing the buffer when in the DONE state altogether.
         if self._state != ParserState.PARSING_DONE:
-            self._buffer.extend(chunk)
+            self._buffer.append(chunk)
 
         # Iterate over and over while there is sufficient data in the buffer.
         # Each loop should either consume data, or move to a state where not
@@ -977,36 +977,36 @@ class StreamingMultipartFormDataParser(object):
         while True:
             # PARSE_BODY state --> Expecting to parse the file contents.
             if self._state == ParserState.PARSE_BODY:
-                # Search for the boundary characters.
-                idx = self._buffer.find(b"-")
-                if idx < 0:
-                    # No match against any boundary character. Write out the
-                    # whole buffer.
-                    data = self._buffer
-                    self._buffer = bytearray()
-                    fut = self._delegate.file_data_received(self._name, data)
-                    if fut is not None:
-                        await fut
-
-                    # Return because the whole buffer was written out.
+                # Search for the boundary characters by peeking the whole
+                # buffer. This will most likely return a smaller amount of
+                # data than the whole buffer, but if the desired character
+                # is not found, it can be passed to the delegate anyway.
+                raw_buff = self._buffer.peek(len(self._buffer))
+                if len(raw_buff) == 0:
+                    # Implies the buffer is outright empty, so return to
+                    # wait for more data.
                     return
 
-                # If 'idx > 0', write the data _up to_ this boundary point,
-                # then proceed in the same manner as 'idx == 0'.
-                if idx > 0:
-                    # Write out all of the data, _up to_ this boundary point,
-                    # then cycle around to check whether we are at the bounary
-                    # or not. This simplifies the logic for checking against
-                    # the boundary cases.
-                    data = self._buffer[:idx]
-                    self._buffer = self._buffer[idx:]
+                buff = bytes(raw_buff)
+                idx = buff.find(b"-")
+                if idx < 0:
+                    # Write out the data up to this point.
                     fut = self._delegate.file_data_received(self._name, data)
                     if fut is not None:
                         await fut
+                    self._buffer.advance(len(buff))
+                    continue
 
-                # Not enough data (technically) to check against. Wait for
-                # more data to be certain whether the boundary was parsed.
-                if len(self._buffer) < len(self._boundary_next):
+                # Check if the buffer is large enough to reach the end.
+                match_size = len(buff[idx:])
+                remaining_size = len(self._search_field)
+                # The current buffer is not large enough for a total match;
+                # check as much as can be checked.
+                if match_size < remaining_size:
+                    if buff[idx:] != self._search_field[:match_size]:
+                        pass
+
+                if len(buff) < len(self._boundary_next[self._bou]):
                     return
 
                 # If the buffer starts with the same contents as

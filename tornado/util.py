@@ -13,6 +13,7 @@ and `.Resolver`.
 import array
 import asyncio
 import atexit
+import collections
 from inspect import getfullargspec
 import os
 import re
@@ -453,6 +454,96 @@ else:
         if os.environ.get("TORNADO_EXTENSION") == "1":
             raise
         _websocket_mask = _websocket_mask_python
+
+
+class _StreamBuffer(object):
+    """
+    A specialized buffer that tries to avoid copies when large pieces
+    of data are encountered.
+    """
+
+    def __init__(self) -> None:
+        # A sequence of (False, bytearray) and (True, memoryview) objects
+        self._buffers = (
+            collections.deque()
+        )  # type: Deque[Tuple[bool, Union[bytearray, memoryview]]]
+        # Position in the first buffer
+        self._first_pos = 0
+        self._size = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    # Data above this size will be appended separately instead
+    # of extending an existing bytearray
+    _large_buf_threshold = 2048
+
+    def append(self, data: Union[bytes, bytearray, memoryview]) -> None:
+        """
+        Append the given piece of data (should be a buffer-compatible object).
+        """
+        size = len(data)
+        if size > self._large_buf_threshold:
+            if not isinstance(data, memoryview):
+                data = memoryview(data)
+            self._buffers.append((True, data))
+        elif size > 0:
+            if self._buffers:
+                is_memview, b = self._buffers[-1]
+                new_buf = is_memview or len(b) >= self._large_buf_threshold
+            else:
+                new_buf = True
+            if new_buf:
+                self._buffers.append((False, bytearray(data)))
+            else:
+                b += data  # type: ignore
+
+        self._size += size
+
+    def peek(self, size: int) -> memoryview:
+        """
+        Get a view over at most ``size`` bytes (possibly fewer) at the
+        current buffer position.
+        """
+        assert size > 0
+        try:
+            is_memview, b = self._buffers[0]
+        except IndexError:
+            return memoryview(b"")
+
+        pos = self._first_pos
+        if is_memview:
+            return typing.cast(memoryview, b[pos : pos + size])
+        else:
+            return memoryview(b)[pos : pos + size]
+
+    def advance(self, size: int) -> None:
+        """
+        Advance the current buffer position by ``size`` bytes.
+        """
+        assert 0 < size <= self._size
+        self._size -= size
+        pos = self._first_pos
+
+        buffers = self._buffers
+        while buffers and size > 0:
+            is_large, b = buffers[0]
+            b_remain = len(b) - size - pos
+            if b_remain <= 0:
+                buffers.popleft()
+                size -= len(b) - pos
+                pos = 0
+            elif is_large:
+                pos += size
+                size = 0
+            else:
+                pos += size
+                del typing.cast(bytearray, b)[:pos]
+                pos = 0
+                size = 0
+
+        assert size == 0
+        self._first_pos = pos
 
 
 def doctests():
